@@ -27,6 +27,7 @@ class MyEventBus {
     //在unRegister时使用,获取subscriber对应的所有eventType
     private val typesBySubscriber =
         HashMap<Any, ArrayList<Any>>()
+    private val stickyEvents = HashMap<Any, Any>()//key为黏性事件的Class,value为上次的黏性事件
     private var currentThreadState: ThreadLocal<PostingThreadState>
     val executorService = ThreadPoolExecutor(
         0, Integer.MAX_VALUE,
@@ -70,6 +71,10 @@ class MyEventBus {
         //从缓存中根据subscriber获取订阅方法ArrayList，如果不存在则创建并放入缓存
         val subscribedEvents = typesBySubscriber[subscriber] ?: ArrayList()
         subscribedEvents.add(eventType)
+        if (subscriberMethod.isSticky){//黏性事件
+            val stickyEvent = stickyEvents[subscriberMethod.eventType]
+            stickyEvent?.let { postSticky(it) }//如果stickyEvents中有该类型的event则postSticky
+        }
     }
 
     private fun findSubscriberMethods(subscriber: Any): ArrayList<SubscriberMethod> {
@@ -80,7 +85,9 @@ class MyEventBus {
                 //通过SubscriberMethod来存储相关信息，降低反射带来的性能损耗
                 val eventType = method.parameters[0].type
                 val threadMode = method.getAnnotation(Subscribe::class.java)!!.threadMode
-                val subscriberMethod = SubscriberMethod(subscriber, method, eventType, threadMode)
+                val isSticky = method.getAnnotation(Subscribe::class.java)!!.isSticky
+                val subscriberMethod =
+                    SubscriberMethod(subscriber, method, eventType, threadMode, isSticky)
                 subscriberMethods.add(subscriberMethod)
             }
         }
@@ -105,6 +112,11 @@ class MyEventBus {
                 }
             }
         }
+    }
+
+    fun postSticky(event: Any) {//黏性事件post
+        stickyEvents[Any::class.java] = event
+        post(event)
     }
 
     private fun postSingleEvent(event: Any, currentThreadState: PostingThreadState) {
@@ -147,8 +159,8 @@ class MyEventBus {
         method.invoke(subscriber, event)
     }
 
-    private fun unRegister() {
-
+    fun unregister(subscriber: Any) {
+        typesBySubscriber.remove(subscriber)
     }
 
     private fun isMainThread(): Boolean {//根据Looper信息判断当前线程是否是主线程
@@ -163,11 +175,12 @@ class MyEventBus {
     }
 }
 
-annotation class Subscribe(val threadMode: ThreadMode)//订阅方法注解
+annotation class Subscribe(val threadMode: ThreadMode, val isSticky: Boolean = false)//订阅方法注解
 enum class ThreadMode { MAIN, POSTING, BACKGROUND, ASYNC }//订阅方法的线程模式
 class SubscriberMethod(
     val subscriber: Any,
     val method: Method,
     val eventType: Any,
-    val threadMode: ThreadMode
+    val threadMode: ThreadMode,
+    val isSticky: Boolean = false
 )
