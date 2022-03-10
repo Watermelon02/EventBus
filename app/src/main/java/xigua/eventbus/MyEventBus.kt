@@ -18,9 +18,7 @@ import java.util.concurrent.TimeUnit
  * date : 2022/3/9 09:11
  */
 @RequiresApi(Build.VERSION_CODES.O)//反射需要的版本
-class MyEventBus() {
-    @Volatile
-    private var eventBus: MyEventBus? = null
+class MyEventBus {
 
     //发送事件时根据EventType在这里获取方法；使用CopyOnWriteArrayList，可能是为了防止多线程时重复写入相同方法
     private val subscribeMethodByEventType =
@@ -29,8 +27,9 @@ class MyEventBus() {
     //在unRegister时使用,获取subscriber对应的所有eventType
     private val typesBySubscriber =
         HashMap<Any, ArrayList<Any>>()
-    private lateinit var currentThreadState: PostingThreadState
-    val executorService = ThreadPoolExecutor(0, Integer.MAX_VALUE,
+    private var currentThreadState: ThreadLocal<PostingThreadState>
+    val executorService = ThreadPoolExecutor(
+        0, Integer.MAX_VALUE,
         60L, TimeUnit.SECONDS,
         SynchronousQueue<Runnable>()
     )//eventBus的默认线程池，在backgroundMode和AsyncMode会用到
@@ -39,16 +38,19 @@ class MyEventBus() {
 
     init {
         //ThreadLocal每个线程会操作自己的本地内存中的currentThreadState，可以避免因为多线程造成的同步问题
-        ThreadLocal.withInitial { currentThreadState = PostingThreadState(isMainThread(), false) }
+        currentThreadState = object : ThreadLocal<PostingThreadState>() {
+            override fun initialValue(): PostingThreadState {
+                return PostingThreadState(isMainThread(), false)
+            }
+        }
     }
 
 
-    fun getDefault(): MyEventBus {//DCL,这里只实现了通过getDefault来获取EventBus的方法，所以各种配置都是默认固定的配置
-        if (eventBus == null) {
-            synchronized(this) {
-                return MyEventBus()
-            }
-        } else return eventBus!!
+    companion object {
+        //DCL,这里只实现了通过getDefault来获取EventBus的方法，所以各种配置都是默认固定的配置
+        @Volatile
+        private var eventBus: MyEventBus? = null
+        fun getDefault(): MyEventBus = eventBus ?: MyEventBus().also { eventBus = it }
     }
 
     fun register(subscriber: Any) {
@@ -66,10 +68,7 @@ class MyEventBus() {
         }
         subscriberMethods.add(subscriberMethod)
         //从缓存中根据subscriber获取订阅方法ArrayList，如果不存在则创建并放入缓存
-        var subscribedEvents = typesBySubscriber[subscriber]
-        if (subscribedEvents == null) {
-            subscribedEvents = ArrayList()
-        }
+        val subscribedEvents = typesBySubscriber[subscriber] ?: ArrayList()
         subscribedEvents.add(eventType)
     }
 
@@ -79,7 +78,7 @@ class MyEventBus() {
         for (method in methods) {
             if (method.getAnnotation(Subscribe::class.java) != null) {
                 //通过SubscriberMethod来存储相关信息，降低反射带来的性能损耗
-                val eventType = method.parameters[0]::class
+                val eventType = method.parameters[0].type
                 val threadMode = method.getAnnotation(Subscribe::class.java)!!.threadMode
                 val subscriberMethod = SubscriberMethod(subscriber, method, eventType, threadMode)
                 subscriberMethods.add(subscriberMethod)
@@ -89,20 +88,20 @@ class MyEventBus() {
     }
 
     fun post(event: Any) {
-        val eventQueue = currentThreadState.eventQueue
+        val threadState = currentThreadState.get()
+        val eventQueue = threadState.eventQueue
         eventQueue.add(event)
-        if (!currentThreadState.isPosting) {
-            currentThreadState.isMainThread = isMainThread()
-            currentThreadState.isPosting = true
+        if (!threadState.isPosting) {
+            threadState.isMainThread = isMainThread()
+            threadState.isPosting = true
             while (eventQueue.isNotEmpty()) {
                 try {
                     while (eventQueue.isNotEmpty()) {
-                        postSingleEvent(eventQueue[0], currentThreadState)
-                        eventQueue.remove(0)
+                        postSingleEvent(eventQueue.removeAt(0), threadState)
                     }
                 } finally {
-                    currentThreadState.isPosting = false
-                    currentThreadState.isMainThread = false
+                    threadState.isPosting = false
+                    threadState.isMainThread = false
                 }
             }
         }
@@ -134,8 +133,8 @@ class MyEventBus() {
             }
             ThreadMode.BACKGROUND -> {
                 if (isMainThread) {
-                    backgroundPoster.enqueue(subscriberMethod,event)
-                }else{
+                    backgroundPoster.enqueue(subscriberMethod, event)
+                } else {
                     invokeSubscriber(subscriberMethod.method, subscriberMethod.subscriber, event)
                 }
             }
