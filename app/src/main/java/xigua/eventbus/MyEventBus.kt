@@ -1,11 +1,15 @@
 package xigua.eventbus
 
 import android.os.Build
+import android.os.Looper
 import androidx.annotation.RequiresApi
-import org.greenrobot.eventbus.EventBus
-import java.lang.Exception
+import xigua.eventbus.poster.BackgroundPoster
+import xigua.eventbus.poster.MainThreadPoster
 import java.lang.reflect.Method
 import java.util.concurrent.CopyOnWriteArrayList
+import java.util.concurrent.SynchronousQueue
+import java.util.concurrent.ThreadPoolExecutor
+import java.util.concurrent.TimeUnit
 
 /**
  * description ： TODO:类的作用
@@ -14,7 +18,7 @@ import java.util.concurrent.CopyOnWriteArrayList
  * date : 2022/3/9 09:11
  */
 @RequiresApi(Build.VERSION_CODES.O)//反射需要的版本
-class MyEventBus {
+class MyEventBus() {
     @Volatile
     private var eventBus: MyEventBus? = null
 
@@ -25,14 +29,21 @@ class MyEventBus {
     //在unRegister时使用,获取subscriber对应的所有eventType
     private val typesBySubscriber =
         HashMap<Any, ArrayList<Any>>()
-    /*private val currentThreadState:PostingThreadState*/
+    private lateinit var currentThreadState: PostingThreadState
+    val executorService = ThreadPoolExecutor(0, Integer.MAX_VALUE,
+        60L, TimeUnit.SECONDS,
+        SynchronousQueue<Runnable>()
+    )//eventBus的默认线程池，在backgroundMode和AsyncMode会用到
+    private val mainThreadPoster = MainThreadPoster(this, Looper.getMainLooper())
+    private val backgroundPoster = BackgroundPoster(this)
 
-    /*constructor() {
-        currentThreadState = PostingThreadState()
-    }*/
+    init {
+        //ThreadLocal每个线程会操作自己的本地内存中的currentThreadState，可以避免因为多线程造成的同步问题
+        ThreadLocal.withInitial { currentThreadState = PostingThreadState(isMainThread(), false) }
+    }
 
 
-    fun getDefault(): MyEventBus {//DCL
+    fun getDefault(): MyEventBus {//DCL,这里只实现了通过getDefault来获取EventBus的方法，所以各种配置都是默认固定的配置
         if (eventBus == null) {
             synchronized(this) {
                 return MyEventBus()
@@ -70,7 +81,7 @@ class MyEventBus {
                 //通过SubscriberMethod来存储相关信息，降低反射带来的性能损耗
                 val eventType = method.parameters[0]::class
                 val threadMode = method.getAnnotation(Subscribe::class.java)!!.threadMode
-                val subscriberMethod = SubscriberMethod(method, eventType, threadMode)
+                val subscriberMethod = SubscriberMethod(subscriber, method, eventType, threadMode)
                 subscriberMethods.add(subscriberMethod)
             }
         }
@@ -78,45 +89,86 @@ class MyEventBus {
     }
 
     fun post(event: Any) {
-        val eventType = event::class.java
-        val subscribedMethods = subscribeMethodByEventType[eventType]
-        if (subscribedMethods == null) {
-            throw Exception("MyEventBus.post: No such eventType error")
-        } else {
-            for (method in subscribedMethods) {
-                runByThreadMode(method.method, method.threadMode, event)
+        val eventQueue = currentThreadState.eventQueue
+        eventQueue.add(event)
+        if (!currentThreadState.isPosting) {
+            currentThreadState.isMainThread = isMainThread()
+            currentThreadState.isPosting = true
+            while (eventQueue.isNotEmpty()) {
+                try {
+                    while (eventQueue.isNotEmpty()) {
+                        postSingleEvent(eventQueue[0], currentThreadState)
+                        eventQueue.remove(0)
+                    }
+                } finally {
+                    currentThreadState.isPosting = false
+                    currentThreadState.isMainThread = false
+                }
             }
         }
     }
 
-    private fun runByThreadMode(method: Method,threadMode: ThreadMode, event: Any) {
-        when (threadMode) {
-            ThreadMode.MAIN -> invokeOnMainThread(method,event)
+    private fun postSingleEvent(event: Any, currentThreadState: PostingThreadState) {
+        val subscriberMethods = subscribeMethodByEventType[event::class.java]
+        subscriberMethods?.let {
+            for (subscriberMethod in subscriberMethods) {
+                runByThreadMode(subscriberMethod, currentThreadState.isMainThread, event)
+            }
+        }
+    }
+
+    private fun runByThreadMode(
+        subscriberMethod: SubscriberMethod,
+        isMainThread: Boolean,
+        event: Any
+    ) {
+        when (subscriberMethod.threadMode) {
+            ThreadMode.MAIN -> {
+                if (isMainThread) {
+                    invokeSubscriber(subscriberMethod.method, subscriberMethod.subscriber, event)
+                } else {
+                    mainThreadPoster.enqueue(subscriberMethod, event)
+                }
+            }
             ThreadMode.POSTING -> {
             }
             ThreadMode.BACKGROUND -> {
+                if (isMainThread) {
+                    backgroundPoster.enqueue(subscriberMethod,event)
+                }else{
+                    invokeSubscriber(subscriberMethod.method, subscriberMethod.subscriber, event)
+                }
             }
             ThreadMode.ASYNC -> {
             }
         }
     }
 
-    private fun invokeOnMainThread(method: Method, event: Any) {
+    fun invokeSubscriber(method: Method, subscriber: Any, event: Any) {
+        method.invoke(subscriber, event)
+    }
+
+    private fun unRegister() {
 
     }
 
-    fun unRegister() {
-
+    private fun isMainThread(): Boolean {//根据Looper信息判断当前线程是否是主线程
+        return Looper.getMainLooper() == Looper.myLooper()
     }
 
-    inner class PostingThreadState(var isMainThread:Boolean,var isPosting:Boolean){
+    inner class PostingThreadState(var isMainThread: Boolean, var isPosting: Boolean) {
         /**
          * 用来存储eventBus当前线程的信息
          * 内部保存一个eventQueue*/
-        val eventQueue = ArrayList<SubscriberMethod>()
+        val eventQueue = ArrayList<Any>()
     }
 }
 
 annotation class Subscribe(val threadMode: ThreadMode)//订阅方法注解
 enum class ThreadMode { MAIN, POSTING, BACKGROUND, ASYNC }//订阅方法的线程模式
-class SubscriberMethod(val method: Method, val eventType: Any, val threadMode: ThreadMode)
+class SubscriberMethod(
+    val subscriber: Any,
+    val method: Method,
+    val eventType: Any,
+    val threadMode: ThreadMode
+)
